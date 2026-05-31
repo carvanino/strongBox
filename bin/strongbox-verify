@@ -1,0 +1,62 @@
+#!/bin/bash
+# Audit log verifier - re-derives every HMAC chain entry
+# Exits non-zero and names corrupted entry if tamper detected
+
+AUDIT_LOG="${1:-/data/audit/audit.log}"
+AUDIT_KEY_FILE="${AUDIT_KEY_FILE:-/data/audit.key}"
+
+if [[ ! -f "$AUDIT_KEY_FILE" ]]; then
+    echo "ERROR: Audit HMAC key not found at $AUDIT_KEY_FILE"
+    exit 2
+fi
+
+AUDIT_HMAC_KEY=$(cat "$AUDIT_KEY_FILE")
+
+if [[ ! -f "$AUDIT_LOG" ]]; then
+    echo "ERROR: Audit log not found at $AUDIT_LOG"
+    exit 2
+fi
+
+echo "Verifying audit log: $AUDIT_LOG"
+
+prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
+index=0
+errors=0
+
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    ts=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['ts'])")
+    event=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['event'])")
+    path=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['path'])")
+    token_id=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['token_id'])")
+    node_id=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['node_id'])")
+    stored_prev=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['prev_hash'])")
+    stored_hash=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['entry_hash'])")
+    stored_index=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['index'])")
+
+    if [[ "$stored_prev" != "$prev_hash" ]]; then
+        echo "TAMPER DETECTED at entry index=$stored_index: prev_hash mismatch"
+        errors=$((errors + 1))
+    fi
+
+    data="${prev_hash}|${index}|${ts}|${event}|${path}|${token_id}|${node_id}"
+    computed_hash=$(echo -n "$data" | openssl dgst -sha256 -mac HMAC \
+        -macopt "hexkey:${AUDIT_HMAC_KEY}" | awk '{print $2}')
+
+    if [[ "$computed_hash" != "$stored_hash" ]]; then
+        echo "TAMPER DETECTED at entry index=$stored_index"
+        errors=$((errors + 1))
+    else
+        echo "OK entry index=$stored_index"
+    fi
+
+    prev_hash="$computed_hash"
+    index=$((index + 1))
+
+done < "$AUDIT_LOG"
+
+echo ""
+echo "Verification complete. Entries checked: $index. Errors: $errors"
+
+exit $([[ $errors -gt 0 ]] && echo 1 || echo 0)
