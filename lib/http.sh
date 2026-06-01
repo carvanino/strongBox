@@ -120,7 +120,7 @@ http_auth_guard() {
     local token="$3"
 
     case "$path" in
-        /v1/sys/health|/v1/sys/init|/v1/sys/unseal|/v1/sys/consensus/*|/healthz) return 0 ;;
+        /v1/sys/health|/v1/sys/init|/v1/sys/unseal|/v1/sys/consensus/*|/v1/auth/login|/healthz) return 0 ;;
     esac
 
     if http_is_sealed; then
@@ -287,6 +287,10 @@ http_route() {
                     ;;
                 /v1/auth/self)
                     [[ "$method" == "GET" ]] && http_call_or_stub handle_auth_self "$token" || http_respond 405 '{"error":"method not allowed"}'
+                    ;;
+                /v1/users/*)
+                    local username="${path#/v1/users/}"
+                    [[ "$method" == "PUT" ]] && http_call_or_stub handle_user_put "$username" "$body" "$token" || http_respond 405 '{"error":"method not allowed"}'
                     ;;
                 /v1/policies/*)
                     local policy_name="${path#/v1/policies/}"

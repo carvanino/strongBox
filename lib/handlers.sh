@@ -421,6 +421,30 @@ handle_auth_self() {
     http_respond 200 "$result"
 }
 
+# PUT /v1/users/{username}
+handle_user_put() {
+    local username="$1"
+    local body="$2"
+    local token="$3"
+
+    local password policies
+    password=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('password',''))" 2>/dev/null)
+    policies=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('policies',[])))" 2>/dev/null)
+
+    if [[ -z "$username" || -z "$password" ]]; then
+        http_respond 400 '{"error":"username and password required"}'
+        return
+    fi
+
+    auth_create_user "$username" "$password" "$policies" || {
+        http_respond 400 '{"error":"failed to create user"}'
+        return
+    }
+
+    audit_append "auth.user.create" "/v1/users/${username}" "$token" "{\"username\":\"$username\"}" 2>/dev/null || true
+    http_respond 201 "{\"username\":\"${username}\",\"policies\":${policies}}"
+}
+
 # PUT /v1/policies/{name}
 handle_policy_put() {
     local policy_name="$1"
