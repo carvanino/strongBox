@@ -9,8 +9,8 @@ StrongBox is not a wrapper around HashiCorp Vault, AWS Secrets Manager, GCP Secr
 The StrongBox deployment consists of three StrongBox nodes, one PostgreSQL target database, and one Nginx reverse proxy. Nginx exposes the public API over HTTP/HTTPS and forwards traffic to the StrongBox cluster. The cluster elects one leader at a time. The leader accepts writes, replicates write operations to peers, and only returns success when a quorum acknowledges replication. Followers reject writes with a leader hint and expose health information for cluster inspection.
 
 ```text
-Public URL: https://<strongbox-domain>
-GitHub repo: https://github.com/<user>/<repo>
+Public URL: http://hng-akinola.duckdns.org
+GitHub repo: https://github.com/carvanino/strongBox
 Cluster size: 3 StrongBox nodes
 Reverse proxy: Nginx + TLS
 Target database: PostgreSQL
@@ -78,7 +78,7 @@ StrongBox reads settings from `config.yaml`. Environment variables override conf
 server:
   bind_host: "0.0.0.0"
   port: 8080
-  public_url: "https://<strongbox-domain>"
+  public_url: "http://hng-akinola.duckdns.org"
 
 cluster:
   node_id: "node1"
@@ -135,7 +135,7 @@ For Docker Compose and Linux VPS deployment, `/run/strongbox` is used as the run
 Start with a Linux VPS that has at least 4 vCPU, 4 GB RAM, and 40 GB disk. Install Docker, Docker Compose, Git, Nginx dependencies, and Certbot. Clone the public repository, configure the domain DNS record to point to the VPS, and start the Compose stack.
 
 ```bash
-git clone https://github.com/<user>/<repo>.git strongbox
+git clone https://github.com/carvanino/strongBox.git strongbox
 cd strongbox
 cp config.yaml config.production.yaml
 ```
@@ -157,7 +157,7 @@ docker compose ps
 Check cluster health through the public URL.
 
 ```bash
-curl -s https://<strongbox-domain>/v1/sys/health | jq
+curl -s http://hng-akinola.duckdns.org/v1/sys/health | jq
 ```
 
 A freshly started cluster reports sealed state. Secret operations return `503` while the vault is sealed.
@@ -167,7 +167,7 @@ A freshly started cluster reports sealed state. Secret operations return `503` w
 Initialize StrongBox once. Initialization creates the master key material, wraps the in-memory key-encryption key, creates Shamir shares, creates the root policy, creates the root token, and prepares audit HMAC material.
 
 ```bash
-curl -s -X POST https://<strongbox-domain>/v1/sys/init | jq
+curl -s -X POST http://hng-akinola.duckdns.org/v1/sys/init | jq
 ```
 
 The response contains the unseal shares and root token.
@@ -182,11 +182,11 @@ The response contains the unseal shares and root token.
 Submit one share per request. With a `2-of-3` threshold, the first valid share records progress and the second valid share reconstructs the master key, unwraps the key-encryption key, clears submitted share material, and transitions the cluster to unsealed state.
 
 ```bash
-curl -s -X POST https://<strongbox-domain>/v1/sys/unseal \
+curl -s -X POST http://hng-akinola.duckdns.org/v1/sys/unseal \
   -H 'Content-Type: application/json' \
   -d '{"share":"share-1"}' | jq
 
-curl -s -X POST https://<strongbox-domain>/v1/sys/unseal \
+curl -s -X POST http://hng-akinola.duckdns.org/v1/sys/unseal \
   -H 'Content-Type: application/json' \
   -d '{"share":"share-2"}' | jq
 ```
@@ -194,7 +194,7 @@ curl -s -X POST https://<strongbox-domain>/v1/sys/unseal \
 Check health again.
 
 ```bash
-curl -s https://<strongbox-domain>/v1/sys/health | jq
+curl -s http://hng-akinola.duckdns.org/v1/sys/health | jq
 ```
 
 The cluster reports `sealed: false`, a current `term`, the local `node_id`, and leader information.
@@ -208,7 +208,7 @@ Create a policy that allows read access to `secret/app/*`.
 ```bash
 ROOT_TOKEN='<root-token-value>'
 
-curl -s -X PUT https://<strongbox-domain>/v1/policies/app-read \
+curl -s -X PUT http://hng-akinola.duckdns.org/v1/policies/app-read \
   -H "Authorization: Bearer $ROOT_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -224,7 +224,7 @@ curl -s -X PUT https://<strongbox-domain>/v1/policies/app-read \
 Create or log in as a user that receives the `app-read` policy.
 
 ```bash
-curl -s -X POST https://<strongbox-domain>/v1/auth/login \
+curl -s -X POST http://hng-akinola.duckdns.org/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"app","password":"<password>"}' | jq
 ```
@@ -234,7 +234,7 @@ Use the returned token for reads. A token with `read` on `secret/app/*` can read
 Revoke a token synchronously.
 
 ```bash
-curl -s -X POST https://<strongbox-domain>/v1/auth/revoke \
+curl -s -X POST http://hng-akinola.duckdns.org/v1/auth/revoke \
   -H "Authorization: Bearer $ROOT_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"token":"<token-to-revoke>"}' -i
@@ -247,7 +247,7 @@ The revoked token returns `401 Unauthorized` on the next request.
 Write a secret to `secret/app/db`.
 
 ```bash
-curl -s -X PUT https://<strongbox-domain>/v1/secrets/app/db \
+curl -s -X PUT http://hng-akinola.duckdns.org/v1/secrets/app/db \
   -H "Authorization: Bearer $ROOT_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -269,7 +269,7 @@ The response returns the created version.
 Write the same path again to create a new version.
 
 ```bash
-curl -s -X PUT https://<strongbox-domain>/v1/secrets/app/db \
+curl -s -X PUT http://hng-akinola.duckdns.org/v1/secrets/app/db \
   -H "Authorization: Bearer $ROOT_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -283,14 +283,14 @@ curl -s -X PUT https://<strongbox-domain>/v1/secrets/app/db \
 Read the latest version.
 
 ```bash
-curl -s https://<strongbox-domain>/v1/secrets/app/db \
+curl -s http://hng-akinola.duckdns.org/v1/secrets/app/db \
   -H "Authorization: Bearer $ROOT_TOKEN" | jq
 ```
 
 Read the first version explicitly.
 
 ```bash
-curl -s 'https://<strongbox-domain>/v1/secrets/app/db?version=1' \
+curl -s 'http://hng-akinola.duckdns.org/v1/secrets/app/db?version=1' \
   -H "Authorization: Bearer $ROOT_TOKEN" | jq
 ```
 
@@ -301,7 +301,7 @@ Every read response includes the secret data, version number, and lease informat
 A read from `dynamic-postgres/readonly` creates a fresh PostgreSQL role on the configured target database, grants readonly permissions, returns the generated username and password, and stores a lease.
 
 ```bash
-curl -s https://<strongbox-domain>/v1/dynamic-postgres/readonly \
+curl -s http://hng-akinola.duckdns.org/v1/dynamic-postgres/readonly \
   -H "Authorization: Bearer $ROOT_TOKEN" | jq
 ```
 
@@ -332,14 +332,14 @@ When the lease expires, the reaper revokes privileges and drops the role. If Pos
 Renew an active lease before it expires.
 
 ```bash
-curl -s -X POST https://<strongbox-domain>/v1/leases/<lease-id>/renew \
+curl -s -X POST http://hng-akinola.duckdns.org/v1/leases/<lease-id>/renew \
   -H "Authorization: Bearer $ROOT_TOKEN" | jq
 ```
 
 Revoke a lease manually.
 
 ```bash
-curl -s -X POST https://<strongbox-domain>/v1/leases/<lease-id>/revoke \
+curl -s -X POST http://hng-akinola.duckdns.org/v1/leases/<lease-id>/revoke \
   -H "Authorization: Bearer $ROOT_TOKEN" -i
 ```
 
@@ -376,7 +376,7 @@ During unseal, StrongBox accepts one Shamir share per request. Once the configur
 Manual seal purges the active key-encryption key and returns the vault to sealed state.
 
 ```bash
-curl -s -X POST https://<strongbox-domain>/v1/sys/seal \
+curl -s -X POST http://hng-akinola.duckdns.org/v1/sys/seal \
   -H "Authorization: Bearer $ROOT_TOKEN" -i
 ```
 
