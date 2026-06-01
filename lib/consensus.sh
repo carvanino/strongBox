@@ -446,7 +446,6 @@ consensus_replicate_write() {
         return 0
     fi
 
-    echo "{\"warning\":\"write committed locally; replication quorum not reached\",\"acks\":$acks,\"quorum\":$quorum}" >&2
-    consensus_note_write_committed
-    return 0
+    echo "{\"error\":\"replication quorum not reached\",\"acks\":$acks,\"quorum\":$quorum}"
+    return 1
 }

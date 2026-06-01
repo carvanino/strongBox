@@ -6,7 +6,7 @@ StrongBox is not a wrapper around HashiCorp Vault, AWS Secrets Manager, GCP Secr
 
 ## Deployment details
 
-The StrongBox deployment consists of three StrongBox nodes, one PostgreSQL target database, and one Nginx reverse proxy. Nginx exposes the public API over HTTPS and forwards traffic to the StrongBox cluster. The cluster elects one leader at a time. The leader accepts writes, replicates committed state to a majority, and returns durable acknowledgements. Followers reject writes with a leader hint and expose health information for cluster inspection.
+The StrongBox deployment consists of three StrongBox nodes, one PostgreSQL target database, and one Nginx reverse proxy. Nginx exposes the public API over HTTP/HTTPS and forwards traffic to the StrongBox cluster. The cluster elects one leader at a time. The leader accepts writes, replicates write operations to peers, and only returns success when a quorum acknowledges replication. Followers reject writes with a leader hint and expose health information for cluster inspection.
 
 ```text
 Public URL: https://<strongbox-domain>
@@ -216,7 +216,7 @@ The cluster reports `sealed: false`, a current `term`, the local `node_id`, and 
 
 ## Authentication and policies
 
-StrongBox uses opaque bearer tokens. Tokens are random values generated from a cryptographically secure source. Raw tokens are returned once and are not stored in plaintext. The server stores token hashes and token state. Every authenticated request checks server-side token state, so revocation takes effect immediately on the next request.
+StrongBox uses opaque bearer tokens. Tokens are random values generated from a cryptographically secure source. Every authenticated request checks server-side token state, so revocation takes effect immediately on the next request.
 
 Create a policy that allows read access to `secret/app/*`.
 
@@ -377,7 +377,7 @@ Each audit entry contains a hash of the previous entry and an HMAC over the curr
 Verify the audit log with:
 
 ```bash
-bin/strongbox-verify /var/log/strongbox/audit.log
+docker compose exec strongbox-1 /app/bin/strongbox-verify /data/audit/audit.log
 ```
 
 A valid log exits with status `0`. A modified log exits non-zero and prints the corrupted entry index.

@@ -25,6 +25,7 @@ HTTP_PORT="${HTTP_PORT:-8200}"
 STORAGE_DIR="${STORAGE_DIR:-/data/secrets}"
 CONSENSUS_DIR="${CONSENSUS_DIR:-/data/consensus}"
 AUDIT_LOG="${AUDIT_LOG:-/data/audit/audit.log}"
+AUDIT_HMAC_KEY_FILE="${AUDIT_HMAC_KEY_FILE:-$(dirname "$AUDIT_LOG")/.audit-hmac-key}"
 SEALED_FILE="${SEALED_FILE:-/data/sealed}"
 SHARES_DIR="${SHARES_DIR:-/data/shares}"
 SHAMIR_K="${SHAMIR_K:-2}"
@@ -45,7 +46,7 @@ if ! mkdir -p "$RUN_DIR" 2>/dev/null; then
     mkdir -p "$RUN_DIR"
 fi
 
-export NODE_ID NODE_ADDR HTTP_PORT STORAGE_DIR CONSENSUS_DIR AUDIT_LOG PEERS
+export NODE_ID NODE_ADDR HTTP_PORT STORAGE_DIR CONSENSUS_DIR AUDIT_LOG AUDIT_HMAC_KEY_FILE PEERS
 export SEALED_FILE SHAMIR_K SHAMIR_N RUN_DIR
 export POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD
 export DYNAMIC_LEASE_TTL
@@ -57,11 +58,18 @@ audit_init   2>/dev/null || true
 dynamic_init 2>/dev/null || true
 lease_init   2>/dev/null || true
 
-# Generate AUDIT_HMAC_KEY_HEX if not set — lives in memory only
+# Generate or load the audit verifier key outside source control.
 if [[ -z "${AUDIT_HMAC_KEY_HEX:-}" ]]; then
-    export AUDIT_HMAC_KEY_HEX
-    AUDIT_HMAC_KEY_HEX=$(openssl rand -hex 32)
+    if [[ -f "$AUDIT_HMAC_KEY_FILE" ]]; then
+        AUDIT_HMAC_KEY_HEX=$(cat "$AUDIT_HMAC_KEY_FILE")
+    else
+        AUDIT_HMAC_KEY_HEX=$(openssl rand -hex 32)
+        umask 077
+        printf '%s\n' "$AUDIT_HMAC_KEY_HEX" > "$AUDIT_HMAC_KEY_FILE"
+        chmod 600 "$AUDIT_HMAC_KEY_FILE" 2>/dev/null || true
+    fi
 fi
+export AUDIT_HMAC_KEY_HEX
 
 # Boot sealed
 touch "$SEALED_FILE"
