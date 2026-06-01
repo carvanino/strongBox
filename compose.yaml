@@ -9,9 +9,14 @@ services:
       PUBLIC_NODE_ADDR: https://157.180.45.114
       PEERS: node2=http://strongbox-2:8200,node3=http://strongbox-3:8200
       POSTGRES_DSN: postgresql://strongbox:strongbox@postgres:5432/strongbox
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: strongbox
+      POSTGRES_USER: strongbox
+      POSTGRES_PASSWORD: strongbox
       CONFIG_PATH: /app/config.yaml
-      STORAGE_DIR: /data/secrets
-      CONSENSUS_DIR: /data/consensus
+      STORAGE_DIR: /dev/shm/strongbox/secrets
+      CONSENSUS_DIR: /dev/shm/strongbox/consensus
     volumes:
       - strongbox_1_data:/data
     depends_on:
@@ -30,9 +35,14 @@ services:
       PUBLIC_NODE_ADDR: https://157.180.45.114
       PEERS: node1=http://strongbox-1:8200,node3=http://strongbox-3:8200
       POSTGRES_DSN: postgresql://strongbox:strongbox@postgres:5432/strongbox
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: strongbox
+      POSTGRES_USER: strongbox
+      POSTGRES_PASSWORD: strongbox
       CONFIG_PATH: /app/config.yaml
-      STORAGE_DIR: /data/secrets
-      CONSENSUS_DIR: /data/consensus
+      STORAGE_DIR: /dev/shm/strongbox/secrets
+      CONSENSUS_DIR: /dev/shm/strongbox/consensus
     volumes:
       - strongbox_2_data:/data
     depends_on:
@@ -51,9 +61,14 @@ services:
       PUBLIC_NODE_ADDR: https://157.180.45.114
       PEERS: node1=http://strongbox-1:8200,node2=http://strongbox-2:8200
       POSTGRES_DSN: postgresql://strongbox:strongbox@postgres:5432/strongbox
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: strongbox
+      POSTGRES_USER: strongbox
+      POSTGRES_PASSWORD: strongbox
       CONFIG_PATH: /app/config.yaml
-      STORAGE_DIR: /data/secrets
-      CONSENSUS_DIR: /data/consensus
+      STORAGE_DIR: /dev/shm/strongbox/secrets
+      CONSENSUS_DIR: /dev/shm/strongbox/consensus
     volumes:
       - strongbox_3_data:/data
     depends_on:
@@ -95,8 +110,8 @@ services:
       fi;
       nginx -g 'daemon off;'"
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HTTP_PUBLIC_PORT:-80}:80"
+      - "${HTTPS_PUBLIC_PORT:-443}:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx_certs:/etc/nginx/certs

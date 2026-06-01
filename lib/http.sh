@@ -65,6 +65,13 @@ json_get() {
     python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$key"
 }
 
+http_header_value() {
+    local value="${1#*:}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
 http_is_sealed() {
     [[ -f "$SEALED_FILE" ]]
 }
@@ -113,7 +120,7 @@ http_auth_guard() {
     local token="$3"
 
     case "$path" in
-        /v1/sys/health|/v1/sys/init|/v1/sys/unseal|/v1/sys/consensus/*|/healthz) return 0 ;;
+        /v1/sys/health|/v1/sys/init|/v1/sys/unseal|/v1/sys/consensus/*|/v1/auth/login|/healthz) return 0 ;;
     esac
 
     if http_is_sealed; then
@@ -281,6 +288,10 @@ http_route() {
                 /v1/auth/self)
                     [[ "$method" == "GET" ]] && http_call_or_stub handle_auth_self "$token" || http_respond 405 '{"error":"method not allowed"}'
                     ;;
+                /v1/users/*)
+                    local username="${path#/v1/users/}"
+                    [[ "$method" == "PUT" ]] && http_call_or_stub handle_user_put "$username" "$body" "$token" || http_respond 405 '{"error":"method not allowed"}'
+                    ;;
                 /v1/policies/*)
                     local policy_name="${path#/v1/policies/}"
                     case "$method" in
@@ -309,19 +320,19 @@ http_route() {
 http_handle_connection() {
     local request_line method target version line content_length=0 auth_header="" body=""
 
-    IFS=$'\r' read -r request_line || return 0
+    IFS= read -r request_line || return 0
     request_line="${request_line//$'\r'/}"
     method="${request_line%% *}"
     target="${request_line#* }"
     target="${target%% *}"
     version="${request_line##* }"
 
-    while IFS=$'\r' read -r line; do
+    while IFS= read -r line; do
         line="${line//$'\r'/}"
         [[ -z "$line" ]] && break
         case "${line,,}" in
-            content-length:*) content_length="${line#*: }" ;;
-            authorization:*) auth_header="${line#*: }" ;;
+            content-length:*) content_length="$(http_header_value "$line")" ;;
+            authorization:*) auth_header="$(http_header_value "$line")" ;;
         esac
     done
 
@@ -344,11 +355,11 @@ http_serve() {
 
     if command -v ncat >/dev/null 2>&1; then
         while true; do
-            ncat -l "$HTTP_HOST" "$HTTP_PORT" -k -c "bash -lc 'source \"$SCRIPT_DIR/http.sh\"; http_handle_connection'"
+            ncat -l "$HTTP_HOST" "$HTTP_PORT" -k -c "$SCRIPT_DIR/../bin/http-handler"
         done
     fi
 
     while true; do
-        ncat -l "$HTTP_HOST" "$HTTP_PORT" -c "bash -lc 'source \"$SCRIPT_DIR/http.sh\"; http_handle_connection'"
+        ncat -l "$HTTP_HOST" "$HTTP_PORT" -c "$SCRIPT_DIR/../bin/http-handler"
     done
 }

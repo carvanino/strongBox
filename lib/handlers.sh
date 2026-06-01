@@ -79,10 +79,16 @@ handle_sys_init() {
         return
     fi
 
-    # Parse optional K and N from request body
-    local k n
-    k=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('secret_shares',${SHAMIR_N}))" 2>/dev/null) || k=$SHAMIR_N
-    n=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('secret_threshold',${SHAMIR_K}))" 2>/dev/null) || n=$SHAMIR_K
+    # Parse optional N and K from request body.
+    # secret_shares is the total number of shares; secret_threshold is how many are required.
+    local shares_total shares_required
+    shares_total=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read() or '{}'); print(d.get('secret_shares',${SHAMIR_N:-3}))" 2>/dev/null) || shares_total=${SHAMIR_N:-3}
+    shares_required=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read() or '{}'); print(d.get('secret_threshold',${SHAMIR_K:-2}))" 2>/dev/null) || shares_required=${SHAMIR_K:-2}
+
+    if ! [[ "$shares_total" =~ ^[0-9]+$ && "$shares_required" =~ ^[0-9]+$ ]] || [[ "$shares_required" -lt 1 || "$shares_total" -lt "$shares_required" ]]; then
+        http_respond 400 '{"error":"invalid Shamir parameters"}'
+        return
+    fi
 
     # Generate master key (KEK) — 32 random bytes
     local master_key
@@ -90,7 +96,7 @@ handle_sys_init() {
 
     # Split master key into N Shamir shares, requiring K to reconstruct
     local shares_json
-    shares_json=$(python3 "$LIB_DIR/shamir.py" split "$master_key" "$k" "$n")
+    shares_json=$(python3 "$LIB_DIR/shamir.py" split "$master_key" "$shares_total" "$shares_required")
 
     # Extract share strings for the response
     local share_strings
@@ -103,10 +109,10 @@ print(json.dumps(result))
 
     # Store init state
     storage_put "sys:initialized" "true"
-    storage_put "sys:shamir_k" "$n"
-    storage_put "sys:shares_required" "$n"
-    storage_put "sys:shamir_n" "$k"
-    storage_put "sys:shares_total" "$k"
+    storage_put "sys:shamir_k" "$shares_required"
+    storage_put "sys:shares_required" "$shares_required"
+    storage_put "sys:shamir_n" "$shares_total"
+    storage_put "sys:shares_total" "$shares_total"
     storage_put "sys:secret_len" "32"
 
     # Create root token — full access, no expiry
@@ -125,7 +131,7 @@ print(json.dumps(result))
 
     # Replicate init to peers
     local peer_payload
-    peer_payload=$(printf '{"root_token":"%s","shares_total":%d,"shares_required":%d}' "$root_token" "$k" "$n")
+    peer_payload=$(printf '{"root_token":"%s","shares_total":%d,"shares_required":%d}' "$root_token" "$shares_total" "$shares_required")
     sys_replicate_to_peers "POST" "/v1/sys/init?replicated=true" "$peer_payload"
 
     # Audit the init event
@@ -413,6 +419,30 @@ handle_auth_self() {
     local result
     result=$(auth_get_self "$token")
     http_respond 200 "$result"
+}
+
+# PUT /v1/users/{username}
+handle_user_put() {
+    local username="$1"
+    local body="$2"
+    local token="$3"
+
+    local password policies
+    password=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('password',''))" 2>/dev/null)
+    policies=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('policies',[])))" 2>/dev/null)
+
+    if [[ -z "$username" || -z "$password" ]]; then
+        http_respond 400 '{"error":"username and password required"}'
+        return
+    fi
+
+    auth_create_user "$username" "$password" "$policies" || {
+        http_respond 400 '{"error":"failed to create user"}'
+        return
+    }
+
+    audit_append "auth.user.create" "/v1/users/${username}" "$token" "{\"username\":\"$username\"}" 2>/dev/null || true
+    http_respond 201 "{\"username\":\"${username}\",\"policies\":${policies}}"
 }
 
 # PUT /v1/policies/{name}

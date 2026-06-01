@@ -1,0 +1,31 @@
+cluster:
+  public_url: "https://157.180.45.114"
+  node_port: 8200
+  election_timeout_min_ms: 900
+  election_timeout_max_ms: 1600
+  heartbeat_interval_ms: 250
+
+seal:
+  secret_shares: 3
+  secret_threshold: 2
+
+storage:
+  backend: "tmpfs"
+  path: "/dev/shm/strongbox/secrets"
+
+leases:
+  default_ttl: 3600
+  max_ttl: 86400
+  reaper_interval: 30
+  retry_backoff_initial: 2
+  retry_backoff_max: 60
+
+postgres:
+  host: "postgres"
+  port: 5432
+  database: "strongbox"
+  user: "strongbox"
+  role_prefix: "sb"
+
+audit:
+  log_path: "/data/audit/audit.log"
