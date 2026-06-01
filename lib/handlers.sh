@@ -3,6 +3,11 @@
 # lib/handlers.sh — Request handlers for StrongBox API endpoints.
 # =============================================================================
 
+# LIB_DIR — path to the lib/ directory.
+# Defined here so it's available in ncat subshells that source this file
+# without going through bin/strongbox.
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # RAM-backed directory for unseal shares and KEK
 RUN_DIR="${RUN_DIR:-/dev/shm/strongbox}"
 if ! mkdir -p "$RUN_DIR" 2>/dev/null; then

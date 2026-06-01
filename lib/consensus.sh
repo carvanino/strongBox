@@ -57,7 +57,8 @@ consensus_load() {
 
 consensus_save() {
     local term="$1" vote="$2" node_state="$3" leader="$4" leader_addr_arg="$5" heartbeat="$6" log_index="$7" log_term="$8"
-    mkdir -p "$CONSENSUS_DIR"
+    mkdir -p "${CONSENSUS_DIR:-/data/consensus}"
+    CONSENSUS_STATE_FILE="${CONSENSUS_STATE_FILE:-${CONSENSUS_DIR:-/data/consensus}/state.env}"
     cat > "$CONSENSUS_STATE_FILE.tmp" <<EOF
 current_term=$term
 voted_for=$vote
