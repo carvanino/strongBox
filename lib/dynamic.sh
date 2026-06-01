@@ -1,12 +1,6 @@
 #!/bin/bash
 # lib/dynamic.sh — Dynamic PostgreSQL credential engine
 
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/storage.sh"
-# Note: lease.sh is NOT sourced here to avoid circular dependency.
-# lease_create must be available in the caller's environment (sourced by bin/strongbox).
-
 POSTGRES_HOST="${POSTGRES_HOST:-localhost}"
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 POSTGRES_DB="${POSTGRES_DB:-postgres}"

@@ -1,23 +1,6 @@
 #!/bin/bash
 # =============================================================================
 # lib/auth.sh — Bearer tokens, Argon2id password hashing, policy enforcement
-#
-# Public interface:
-#   auth_init
-#   auth_create_user <username> <password> <policies_json>
-#   auth_login       <username> <password>       → token or "FAIL"
-#   auth_verify_token <token>                    → policies JSON or "INVALID"
-#   auth_revoke_token <token>                    → 0 on success
-#   auth_get_self     <token>                    → JSON {token_id,policies,ttl}
-#   auth_check_policy <token> <path> <cap>       → "ALLOW" or "DENY"
-#   policy_put <name> <rules_json>               → 0 on success
-#   policy_get <name>                            → rules JSON
-# =============================================================================
-
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/storage.sh"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # All thresholds come from environment variables injected by config.yaml.

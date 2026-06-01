@@ -1,10 +1,6 @@
 #!/bin/bash
 # lib/lease.sh — Leasing, TTLs, background reaper
 
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/storage.sh"
-
 DEFAULT_TTL="${DEFAULT_LEASE_TTL:-3600}"
 MAX_TTL="${MAX_LEASE_TTL:-86400}"
 REAPER_INTERVAL="${REAPER_INTERVAL:-30}"
