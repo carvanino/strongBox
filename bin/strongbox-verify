@@ -1,62 +1,106 @@
-#!/bin/bash
-# Audit log verifier - re-derives every HMAC chain entry
-# Exits non-zero and names corrupted entry if tamper detected
+#!/usr/bin/env python3
+"""Verify StrongBox tamper-evident audit logs."""
 
-AUDIT_LOG="${1:-/data/audit/audit.log}"
-AUDIT_KEY_FILE="${AUDIT_KEY_FILE:-/data/audit.key}"
+from __future__ import annotations
 
-if [[ ! -f "$AUDIT_KEY_FILE" ]]; then
-    echo "ERROR: Audit HMAC key not found at $AUDIT_KEY_FILE"
-    exit 2
-fi
+import hashlib
+import hmac
+import json
+import os
+import sys
+from pathlib import Path
 
-AUDIT_HMAC_KEY=$(cat "$AUDIT_KEY_FILE")
 
-if [[ ! -f "$AUDIT_LOG" ]]; then
-    echo "ERROR: Audit log not found at $AUDIT_LOG"
-    exit 2
-fi
+GENESIS_HASH = "0" * 64
+HASH_FIELDS_TO_REMOVE = {"entry_hash", "hmac"}
 
-echo "Verifying audit log: $AUDIT_LOG"
 
-prev_hash="0000000000000000000000000000000000000000000000000000000000000000"
-index=0
-errors=0
+def canonical_payload(entry: dict) -> str:
+    payload = {k: v for k, v in entry.items() if k not in HASH_FIELDS_TO_REMOVE}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
-while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
 
-    ts=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['ts'])")
-    event=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['event'])")
-    path=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['path'])")
-    token_id=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['token_id'])")
-    node_id=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['node_id'])")
-    stored_prev=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['prev_hash'])")
-    stored_hash=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['entry_hash'])")
-    stored_index=$(echo "$line" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['index'])")
+def summarize(entry: dict) -> str:
+    op = entry.get("op", "?")
+    path = entry.get("path", "?")
+    token_id = entry.get("token_id", "?")
+    return f"op={op} path={path} token_id={token_id}"
 
-    if [[ "$stored_prev" != "$prev_hash" ]]; then
-        echo "TAMPER DETECTED at entry index=$stored_index: prev_hash mismatch"
-        errors=$((errors + 1))
-    fi
 
-    data="${prev_hash}|${index}|${ts}|${event}|${path}|${token_id}|${node_id}"
-    computed_hash=$(echo -n "$data" | openssl dgst -sha256 -mac HMAC \
-        -macopt "hexkey:${AUDIT_HMAC_KEY}" | awk '{print $2}')
+def tampered(index: int, summary: str) -> int:
+    print(f"TAMPERED: entry index {index} — {summary}")
+    return 1
 
-    if [[ "$computed_hash" != "$stored_hash" ]]; then
-        echo "TAMPER DETECTED at entry index=$stored_index"
-        errors=$((errors + 1))
-    else
-        echo "OK entry index=$stored_index"
-    fi
 
-    prev_hash="$computed_hash"
-    index=$((index + 1))
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage: strongbox-verify <audit-log-path>", file=sys.stderr)
+        return 2
 
-done < "$AUDIT_LOG"
+    key_hex = os.environ.get("AUDIT_HMAC_KEY_HEX", "")
+    if not key_hex:
+        print("ERROR: AUDIT_HMAC_KEY_HEX is required", file=sys.stderr)
+        return 2
 
-echo ""
-echo "Verification complete. Entries checked: $index. Errors: $errors"
+    try:
+        key = bytes.fromhex(key_hex)
+    except ValueError:
+        print("ERROR: AUDIT_HMAC_KEY_HEX must be hex", file=sys.stderr)
+        return 2
 
-exit $([[ $errors -gt 0 ]] && echo 1 || echo 0)
+    log_path = Path(sys.argv[1])
+    if not log_path.is_file():
+        print(f"ERROR: Audit log not found at {log_path}", file=sys.stderr)
+        return 2
+
+    prev_hash = GENESIS_HASH
+    count = 0
+
+    with log_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            index = count
+
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                return tampered(index, "malformed JSON")
+
+            summary = summarize(entry)
+            required = {
+                "ts",
+                "token_id",
+                "op",
+                "path",
+                "version",
+                "lease_id",
+                "node_id",
+                "prev_hash",
+                "entry_hash",
+                "hmac",
+            }
+            missing = sorted(required - set(entry))
+            if missing:
+                return tampered(index, f"{summary} missing={','.join(missing)}")
+
+            if entry.get("prev_hash") != prev_hash:
+                return tampered(index, f"{summary} prev_hash mismatch")
+
+            computed_hash = hashlib.sha256(canonical_payload(entry).encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(str(entry.get("entry_hash", "")), computed_hash):
+                return tampered(index, f"{summary} entry_hash mismatch")
+
+            computed_hmac = hmac.new(key, computed_hash.encode("ascii"), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(str(entry.get("hmac", "")), computed_hmac):
+                return tampered(index, f"{summary} hmac mismatch")
+
+            prev_hash = computed_hash
+            count += 1
+
+    print(f"OK: entries={count} final_hash={prev_hash}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
