@@ -8,6 +8,12 @@
 # without going through bin/strongbox.
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Ensure auth functions (including policy_put) are available.
+if ! declare -F policy_put >/dev/null 2>&1; then
+    # shellcheck source=lib/auth.sh
+    source "$LIB_DIR/auth.sh"
+fi
+
 # RAM-backed directory for unseal shares and KEK
 RUN_DIR="${RUN_DIR:-/dev/shm/strongbox}"
 if ! mkdir -p "$RUN_DIR" 2>/dev/null; then
