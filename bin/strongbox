@@ -45,6 +45,31 @@ export DYNAMIC_LEASE_TTL
 
 # Temporary store for unseal shares (in memory only — never persisted)
 COLLECTED_SHARES=()
+RUN_DIR="/dev/shm/strongbox"
+if ! mkdir -p "$RUN_DIR" 2>/dev/null; then
+    RUN_DIR="/tmp/strongbox-run"
+    mkdir -p "$RUN_DIR"
+fi
+
+# Helper to replicate system operations (init, unseal, seal) to peers
+sys_replicate_to_peers() {
+    local method="$1"
+    local path_with_query="$2"
+    local body="$3"
+
+    local peer peer_id peer_addr
+    IFS=',' read -ra peer_items <<< "${PEERS:-}"
+    for peer in "${peer_items[@]}"; do
+        [[ -z "$peer" ]] && continue
+        peer_id="${peer%%=*}"
+        peer_addr="${peer#*=}"
+        curl -fsS --max-time 2 \
+            -X "$method" \
+            -H "Content-Type: application/json" \
+            -d "$body" \
+            "$peer_addr$path_with_query" >/dev/null 2>&1 || true
+    done
+}
 
 # ── Initialise subsystems ─────────────────────────────────────────────────────
 mkdir -p "$STORAGE_DIR" "$CONSENSUS_DIR" "$SHARES_DIR" "$(dirname "$AUDIT_LOG")"
@@ -70,6 +95,32 @@ echo "[strongbox] Node $NODE_ID booting sealed on port $HTTP_PORT" >&2
 # creates root token. Returns shares + root_token.
 handle_sys_init() {
     local body="$1"
+    local query="${2:-}"
+
+    # If it's a replicated request from another node
+    if [[ "$query" == *"replicated=true"* ]]; then
+        local root_token shares_total shares_required
+        root_token=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('root_token',''))" 2>/dev/null)
+        shares_total=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('shares_total',''))" 2>/dev/null)
+        shares_required=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('shares_required',''))" 2>/dev/null)
+
+        storage_put "sys:initialized" "true"
+        storage_put "sys:shamir_k" "$shares_required"
+        storage_put "sys:shares_required" "$shares_required"
+        storage_put "sys:shamir_n" "$shares_total"
+        storage_put "sys:shares_total" "$shares_total"
+        storage_put "sys:secret_len" "32"
+
+        storage_put "token:${root_token}:valid"      "true"
+        storage_put "token:${root_token}:policies"   '["root"]'
+        storage_put "token:${root_token}:created_at" "$(date +%s)"
+        storage_put "token:${root_token}:username"   "root"
+
+        policy_put "root" '[{"path":"*","capabilities":["read","write","delete"]}]'
+
+        http_respond 201 '{"status":"initialized"}'
+        return
+    fi
 
     # Cannot init twice
     if storage_get "sys:initialized" &>/dev/null; then
@@ -102,12 +153,10 @@ print(json.dumps(result))
     # Store init state
     storage_put "sys:initialized" "true"
     storage_put "sys:shamir_k" "$n"
-    storage_put "sys:shamir_n" "$k"
-    storage_put "sys:secret_len" "32"
-
-    # Store each wrapped share — share itself not stored, only count
-    storage_put "sys:shares_total" "$k"
     storage_put "sys:shares_required" "$n"
+    storage_put "sys:shamir_n" "$k"
+    storage_put "sys:shares_total" "$k"
+    storage_put "sys:secret_len" "32"
 
     # Create root token — full access, no expiry
     local root_token
@@ -123,6 +172,11 @@ print(json.dumps(result))
     # Zero master key variable
     master_key=""
 
+    # Replicate init to peers
+    local peer_payload
+    peer_payload=$(printf '{"root_token":"%s","shares_total":%d,"shares_required":%d}' "$root_token" "$k" "$n")
+    sys_replicate_to_peers "POST" "/v1/sys/init?replicated=true" "$peer_payload"
+
     # Audit the init event
     audit_append "sys.init" "/v1/sys/init" "root" "{}" 2>/dev/null || true
 
@@ -134,6 +188,7 @@ print(json.dumps(result))
 # loads KEK into memory, transitions to unsealed.
 handle_sys_unseal() {
     local body="$1"
+    local query="${2:-}"
 
     local share
     share=$(printf '%s' "$body" | python3 -c "
@@ -147,16 +202,33 @@ print(d.get('share', ''))
         return
     fi
 
-    # Add to in-memory collection
-    COLLECTED_SHARES+=("$share")
+    # Replicate to peers if not already replicated
+    if [[ "$query" != *"replicated=true"* ]]; then
+        sys_replicate_to_peers "POST" "/v1/sys/unseal?replicated=true" "$body"
+    fi
+
+    # Save to RAM-backed shares file
+    mkdir -p "$RUN_DIR"
+    if [[ -f "$RUN_DIR/shares" ]]; then
+        if ! grep -qxF "$share" "$RUN_DIR/shares"; then
+            echo "$share" >> "$RUN_DIR/shares"
+        fi
+    else
+        echo "$share" > "$RUN_DIR/shares"
+    fi
 
     local k
     k=$(storage_get "sys:shares_required" 2>/dev/null) || k=$SHAMIR_K
-    local collected=${#COLLECTED_SHARES[@]}
+
+    local collected_shares=()
+    if [[ -f "$RUN_DIR/shares" ]]; then
+        mapfile -t collected_shares < "$RUN_DIR/shares"
+    fi
+    local collected=${#collected_shares[@]}
 
     if [[ $collected -lt $k ]]; then
-        # Not enough shares yet
-        rm -f "$SEALED_FILE"
+        # Not enough shares yet (vault remains sealed)
+        touch "$SEALED_FILE"
         http_respond 200 "{\"sealed\":true,\"progress\":\"${collected}/${k}\"}"
         return
     fi
@@ -174,22 +246,31 @@ for s in sys.argv[1:]:
     x, y = s.split(',', 1)
     shares.append({'x': int(x), 'y': y})
 print(json.dumps(shares))
-" "${COLLECTED_SHARES[@]}")
+" "${collected_shares[@]}")
 
     local master_key
     master_key=$(python3 "$LIB_DIR/shamir.py" reconstruct "$shares_json" "$secret_len" 2>/dev/null)
 
     if [[ -z "$master_key" ]]; then
         http_respond 400 '{"error":"share reconstruction failed — invalid or insufficient shares"}'
-        COLLECTED_SHARES=()
+        # Clear RAM shares
+        if [[ -f "$RUN_DIR/shares" ]]; then
+            dd if=/dev/zero of="$RUN_DIR/shares" bs=1 count=128 conv=notrunc 2>/dev/null || true
+            rm -f "$RUN_DIR/shares"
+        fi
         return
     fi
 
-    # Load KEK into crypto module memory
+    # Load KEK into crypto module memory (RAM file)
     crypto_set_kek "$master_key"
 
     # Zero shares and master key from memory immediately
-    COLLECTED_SHARES=()
+    if [[ -f "$RUN_DIR/shares" ]]; then
+        local size
+        size=$(wc -c < "$RUN_DIR/shares" 2>/dev/null || echo 128)
+        dd if=/dev/zero of="$RUN_DIR/shares" bs=1 count="$size" conv=notrunc 2>/dev/null || true
+        rm -f "$RUN_DIR/shares"
+    fi
     master_key=""
     shares_json=""
 
@@ -205,9 +286,24 @@ print(json.dumps(shares))
 # Purges the KEK from memory and returns to sealed state.
 handle_sys_seal() {
     local token="${1:-}"
+    local query="${2:-}"
+
+    # Replicate to peers if not already replicated
+    if [[ "$query" != *"replicated=true"* ]]; then
+        sys_replicate_to_peers "POST" "/v1/sys/seal?replicated=true" ""
+    fi
+
     crypto_zero_kek
     touch "$SEALED_FILE"
-    COLLECTED_SHARES=()
+    
+    # Zero and delete RAM shares
+    if [[ -f "$RUN_DIR/shares" ]]; then
+        local size
+        size=$(wc -c < "$RUN_DIR/shares" 2>/dev/null || echo 128)
+        dd if=/dev/zero of="$RUN_DIR/shares" bs=1 count="$size" conv=notrunc 2>/dev/null || true
+        rm -f "$RUN_DIR/shares"
+    fi
+
     audit_append "sys.seal" "/v1/sys/seal" "$token" "{}" 2>/dev/null || true
     http_no_content
 }

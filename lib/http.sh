@@ -181,6 +181,7 @@ http_route() {
     local auth_header="$4"
     local replication_mode="${5:-false}"
     local path="${raw_path%%\?*}"
+    [[ "$path" != "/" ]] && path="${path%/}"
     local query=""
     [[ "$raw_path" == *\?* ]] && query="${raw_path#*\?}"
 
@@ -249,13 +250,13 @@ http_route() {
             http_respond 200 "{\"term\":$(consensus_current_term),\"accepted\":true}"
             ;;
         "POST /v1/sys/init")
-            http_call_or_stub handle_sys_init "$body"
+            http_call_or_stub handle_sys_init "$body" "$query"
             ;;
         "POST /v1/sys/unseal")
-            http_call_or_stub handle_sys_unseal "$body"
+            http_call_or_stub handle_sys_unseal "$body" "$query"
             ;;
         "POST /v1/sys/seal")
-            http_call_or_stub handle_sys_seal "$token"
+            http_call_or_stub handle_sys_seal "$token" "$query"
             ;;
         *)
             case "$path" in

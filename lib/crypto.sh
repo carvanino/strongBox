@@ -3,19 +3,33 @@
 # Every secret gets its own DEK (data encryption key)
 # DEK is wrapped by the KEK (master key) that lives only in memory
 
-# Global KEK - lives in memory only, never written to disk
-STRONGBOX_KEK=""
+# Store KEK and unseal shares in a RAM-backed (tmpfs) directory so that they persist
+# across the independent bash processes spawned by ncat for each TCP connection,
+# while remaining purely in-memory (volatile RAM) as required.
+RUN_DIR="/dev/shm/strongbox"
+if ! mkdir -p "$RUN_DIR" 2>/dev/null; then
+    RUN_DIR="/tmp/strongbox-run"
+    mkdir -p "$RUN_DIR"
+fi
 
 crypto_set_kek() {
-    STRONGBOX_KEK="$1"
+    mkdir -p "$RUN_DIR"
+    echo -n "$1" > "$RUN_DIR/kek"
 }
 
 crypto_get_kek() {
-    echo "$STRONGBOX_KEK"
+    if [[ -f "$RUN_DIR/kek" ]]; then
+        cat "$RUN_DIR/kek"
+    fi
 }
 
 crypto_zero_kek() {
-    STRONGBOX_KEK=""
+    if [[ -f "$RUN_DIR/kek" ]]; then
+        local size
+        size=$(wc -c < "$RUN_DIR/kek" 2>/dev/null || echo 64)
+        dd if=/dev/zero of="$RUN_DIR/kek" bs=1 count="$size" conv=notrunc 2>/dev/null || true
+        rm -f "$RUN_DIR/kek"
+    fi
 }
 
 crypto_generate_key() {
@@ -53,7 +67,8 @@ crypto_decrypt_aes_gcm() {
 
 crypto_wrap_dek() {
     local dek_hex="$1"
-    local kek="$STRONGBOX_KEK"
+    local kek
+    kek=$(crypto_get_kek)
 
     if [[ -z "$kek" ]]; then
         echo '{"error":"vault is sealed"}' >&2
@@ -71,7 +86,8 @@ crypto_wrap_dek() {
 crypto_unwrap_dek() {
     local wrapped_dek="$1"
     local nonce="$2"
-    local kek="$STRONGBOX_KEK"
+    local kek
+    kek=$(crypto_get_kek)
 
     if [[ -z "$kek" ]]; then
         echo "vault is sealed" >&2
