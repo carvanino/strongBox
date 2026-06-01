@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/consensus.sh
 source "$SCRIPT_DIR/consensus.sh"
 
-for module in storage crypto auth lease dynamic audit; do
+for module in storage crypto auth lease dynamic audit handlers; do
     if [[ -f "$SCRIPT_DIR/$module.sh" ]]; then
         # shellcheck disable=SC1090
         source "$SCRIPT_DIR/$module.sh"
