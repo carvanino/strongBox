@@ -1,0 +1,115 @@
+services:
+  strongbox-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ID: node1
+      NODE_ADDR: http://strongbox-1:8200
+      PUBLIC_NODE_ADDR: https://157.180.45.114
+      PEERS: node2=http://strongbox-2:8200,node3=http://strongbox-3:8200
+      POSTGRES_DSN: postgresql://strongbox:strongbox@postgres:5432/strongbox
+      CONFIG_PATH: /app/config.yaml
+      STORAGE_DIR: /data/secrets
+      CONSENSUS_DIR: /data/consensus
+    volumes:
+      - strongbox_1_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - strongbox
+
+  strongbox-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ID: node2
+      NODE_ADDR: http://strongbox-2:8200
+      PUBLIC_NODE_ADDR: https://157.180.45.114
+      PEERS: node1=http://strongbox-1:8200,node3=http://strongbox-3:8200
+      POSTGRES_DSN: postgresql://strongbox:strongbox@postgres:5432/strongbox
+      CONFIG_PATH: /app/config.yaml
+      STORAGE_DIR: /data/secrets
+      CONSENSUS_DIR: /data/consensus
+    volumes:
+      - strongbox_2_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - strongbox
+
+  strongbox-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ID: node3
+      NODE_ADDR: http://strongbox-3:8200
+      PUBLIC_NODE_ADDR: https://157.180.45.114
+      PEERS: node1=http://strongbox-1:8200,node2=http://strongbox-2:8200
+      POSTGRES_DSN: postgresql://strongbox:strongbox@postgres:5432/strongbox
+      CONFIG_PATH: /app/config.yaml
+      STORAGE_DIR: /data/secrets
+      CONSENSUS_DIR: /data/consensus
+    volumes:
+      - strongbox_3_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - strongbox
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: strongbox
+      POSTGRES_PASSWORD: strongbox
+      POSTGRES_DB: strongbox
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U strongbox -d strongbox"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - strongbox
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    depends_on:
+      - strongbox-1
+      - strongbox-2
+      - strongbox-3
+    command: >
+      sh -c "if [ ! -f /etc/nginx/certs/fullchain.pem ]; then
+      openssl req -x509 -nodes -newkey rsa:2048 -days 30
+      -subj '/CN=strongbox.local'
+      -keyout /etc/nginx/certs/privkey.pem
+      -out /etc/nginx/certs/fullchain.pem;
+      fi;
+      nginx -g 'daemon off;'"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_certs:/etc/nginx/certs
+    networks:
+      - strongbox
+
+networks:
+  strongbox:
+    driver: bridge
+
+volumes:
+  strongbox_1_data:
+  strongbox_2_data:
+  strongbox_3_data:
+  postgres_data:
+  nginx_certs:
