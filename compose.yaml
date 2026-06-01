@@ -17,6 +17,8 @@ services:
       CONFIG_PATH: /app/config.yaml
       STORAGE_DIR: /dev/shm/strongbox/secrets
       CONSENSUS_DIR: /dev/shm/strongbox/consensus
+      DYNAMIC_LEASE_TTL: ${DYNAMIC_LEASE_TTL:-3600}
+      REAPER_INTERVAL: ${REAPER_INTERVAL:-30}
     volumes:
       - strongbox_1_data:/data
     depends_on:
@@ -43,6 +45,8 @@ services:
       CONFIG_PATH: /app/config.yaml
       STORAGE_DIR: /dev/shm/strongbox/secrets
       CONSENSUS_DIR: /dev/shm/strongbox/consensus
+      DYNAMIC_LEASE_TTL: ${DYNAMIC_LEASE_TTL:-3600}
+      REAPER_INTERVAL: ${REAPER_INTERVAL:-30}
     volumes:
       - strongbox_2_data:/data
     depends_on:
@@ -69,6 +73,8 @@ services:
       CONFIG_PATH: /app/config.yaml
       STORAGE_DIR: /dev/shm/strongbox/secrets
       CONSENSUS_DIR: /dev/shm/strongbox/consensus
+      DYNAMIC_LEASE_TTL: ${DYNAMIC_LEASE_TTL:-3600}
+      REAPER_INTERVAL: ${REAPER_INTERVAL:-30}
     volumes:
       - strongbox_3_data:/data
     depends_on:

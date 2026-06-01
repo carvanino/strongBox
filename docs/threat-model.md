@@ -173,7 +173,7 @@ HMAC chain
 previous hash included in each entry
 strongbox-verify recomputes chain from genesis
 verification fails with corrupted entry index
-audit HMAC key not stored in plaintext
+audit HMAC key stored outside source control with restrictive file permissions
 ```
 
 Limitation:
@@ -636,7 +636,7 @@ dynamic PostgreSQL password
 Before submission:
 
 - [ ] No raw secret values in logs.
-- [ ] No raw bearer tokens stored.
+- [ ] Bearer token storage reviewed and minimized.
 - [ ] Passwords hashed with Argon2id.
 - [ ] KEK not stored in plaintext.
 - [ ] Shamir shares not stored after unseal.
