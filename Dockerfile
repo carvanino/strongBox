@@ -13,12 +13,15 @@ RUN apt-get update \
         ncat \
         openssl \
         python3 \
+        python3-pip \
         postgresql-client \
         argon2 \
+    && pip3 install argon2-cffi --break-system-packages \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . /app
+RUN chmod +x /app/bin/strongbox /app/bin/strongbox-verify
 
 EXPOSE 8200
 

@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/strongbox — Main entrypoint for the StrongBox server.
+#
+# Sources all lib modules, registers HTTP handlers, and starts the server.
+# =============================================================================
+
+set -uo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LIB_DIR="$APP_DIR/lib"
+
+# ── Source all modules ────────────────────────────────────────────────────────
+for module in storage crypto shamir auth lease dynamic audit consensus http; do
+    if [[ -f "$LIB_DIR/${module}.sh" ]]; then
+        # shellcheck disable=SC1090
+        source "$LIB_DIR/${module}.sh"
+    fi
+done
+
+# ── Config from environment ───────────────────────────────────────────────────
+NODE_ID="${NODE_ID:-node1}"
+NODE_ADDR="${NODE_ADDR:-http://127.0.0.1:8200}"
+HTTP_PORT="${HTTP_PORT:-8200}"
+STORAGE_DIR="${STORAGE_DIR:-/data/secrets}"
+CONSENSUS_DIR="${CONSENSUS_DIR:-/data/consensus}"
+AUDIT_LOG="${AUDIT_LOG:-/data/audit/audit.log}"
+SEALED_FILE="${SEALED_FILE:-/data/sealed}"
+SHARES_DIR="${SHARES_DIR:-/data/shares}"
+SHAMIR_K="${SHAMIR_K:-2}"
+SHAMIR_N="${SHAMIR_N:-3}"
+
+# Postgres env for dynamic.sh
+POSTGRES_HOST="${POSTGRES_HOST:-localhost}"
+POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+POSTGRES_DB="${POSTGRES_DB:-strongbox}"
+POSTGRES_USER="${POSTGRES_USER:-strongbox}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-strongbox}"
+DYNAMIC_LEASE_TTL="${DYNAMIC_LEASE_TTL:-3600}"
+
+export NODE_ID NODE_ADDR HTTP_PORT STORAGE_DIR CONSENSUS_DIR AUDIT_LOG
+export SEALED_FILE SHAMIR_K SHAMIR_N
+export POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD
+export DYNAMIC_LEASE_TTL
+
+# Temporary store for unseal shares (in memory only — never persisted)
+COLLECTED_SHARES=()
+
+# ── Initialise subsystems ─────────────────────────────────────────────────────
+mkdir -p "$STORAGE_DIR" "$CONSENSUS_DIR" "$SHARES_DIR" "$(dirname "$AUDIT_LOG")"
+storage_init 2>/dev/null || true
+audit_init   2>/dev/null || true
+dynamic_init 2>/dev/null || true
+lease_init   2>/dev/null || true
+
+# Generate AUDIT_HMAC_KEY_HEX if not set — lives in memory only
+if [[ -z "${AUDIT_HMAC_KEY_HEX:-}" ]]; then
+    export AUDIT_HMAC_KEY_HEX
+    AUDIT_HMAC_KEY_HEX=$(openssl rand -hex 32)
+fi
+
+# Boot sealed
+touch "$SEALED_FILE"
+echo "[strongbox] Node $NODE_ID booting sealed on port $HTTP_PORT" >&2
+
+# ── HTTP Handlers ─────────────────────────────────────────────────────────────
+
+# POST /v1/sys/init
+# One-time initialisation. Generates master key, splits into Shamir shares,
+# creates root token. Returns shares + root_token.
+handle_sys_init() {
+    local body="$1"
+
+    # Cannot init twice
+    if storage_get "sys:initialized" &>/dev/null; then
+        http_respond 400 '{"error":"already initialized"}'
+        return
+    fi
+
+    # Parse optional K and N from request body
+    local k n
+    k=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('secret_shares',${SHAMIR_N}))" 2>/dev/null) || k=$SHAMIR_N
+    n=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('secret_threshold',${SHAMIR_K}))" 2>/dev/null) || n=$SHAMIR_K
+
+    # Generate master key (KEK) — 32 random bytes
+    local master_key
+    master_key=$(openssl rand -hex 32)
+
+    # Split master key into N Shamir shares, requiring K to reconstruct
+    local shares_json
+    shares_json=$(python3 "$LIB_DIR/shamir.py" split "$master_key" "$k" "$n")
+
+    # Extract share strings for the response
+    local share_strings
+    share_strings=$(python3 -c "
+import json, sys
+shares = json.loads(sys.argv[1])
+result = ['{},{}'.format(s['x'], s['y']) for s in shares]
+print(json.dumps(result))
+" "$shares_json")
+
+    # Store init state
+    storage_put "sys:initialized" "true"
+    storage_put "sys:shamir_k" "$n"
+    storage_put "sys:shamir_n" "$k"
+    storage_put "sys:secret_len" "32"
+
+    # Store each wrapped share — share itself not stored, only count
+    storage_put "sys:shares_total" "$k"
+    storage_put "sys:shares_required" "$n"
+
+    # Create root token — full access, no expiry
+    local root_token
+    root_token=$(openssl rand -hex 32)
+    storage_put "token:${root_token}:valid"      "true"
+    storage_put "token:${root_token}:policies"   '["root"]'
+    storage_put "token:${root_token}:created_at" "$(date +%s)"
+    storage_put "token:${root_token}:username"   "root"
+
+    # Store root policy
+    policy_put "root" '[{"path":"*","capabilities":["read","write","delete"]}]'
+
+    # Zero master key variable
+    master_key=""
+
+    # Audit the init event
+    audit_append "sys.init" "/v1/sys/init" "root" "{}" 2>/dev/null || true
+
+    http_respond 201 "{\"shares\":${share_strings},\"root_token\":\"${root_token}\"}"
+}
+
+# POST /v1/sys/unseal {share}
+# Accumulates shares. Once K shares collected, reconstructs master key,
+# loads KEK into memory, transitions to unsealed.
+handle_sys_unseal() {
+    local body="$1"
+
+    local share
+    share=$(printf '%s' "$body" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+print(d.get('share', ''))
+" 2>/dev/null)
+
+    if [[ -z "$share" ]]; then
+        http_respond 400 '{"error":"share is required"}'
+        return
+    fi
+
+    # Add to in-memory collection
+    COLLECTED_SHARES+=("$share")
+
+    local k
+    k=$(storage_get "sys:shares_required" 2>/dev/null) || k=$SHAMIR_K
+    local collected=${#COLLECTED_SHARES[@]}
+
+    if [[ $collected -lt $k ]]; then
+        # Not enough shares yet
+        rm -f "$SEALED_FILE"
+        http_respond 200 "{\"sealed\":true,\"progress\":\"${collected}/${k}\"}"
+        return
+    fi
+
+    # Have K shares — reconstruct master key
+    local secret_len
+    secret_len=$(storage_get "sys:secret_len" 2>/dev/null) || secret_len=32
+
+    # Build shares JSON array for shamir.py
+    local shares_json
+    shares_json=$(python3 -c "
+import sys, json
+shares = []
+for s in sys.argv[1:]:
+    x, y = s.split(',', 1)
+    shares.append({'x': int(x), 'y': y})
+print(json.dumps(shares))
+" "${COLLECTED_SHARES[@]}")
+
+    local master_key
+    master_key=$(python3 "$LIB_DIR/shamir.py" reconstruct "$shares_json" "$secret_len" 2>/dev/null)
+
+    if [[ -z "$master_key" ]]; then
+        http_respond 400 '{"error":"share reconstruction failed — invalid or insufficient shares"}'
+        COLLECTED_SHARES=()
+        return
+    fi
+
+    # Load KEK into crypto module memory
+    crypto_set_kek "$master_key"
+
+    # Zero shares and master key from memory immediately
+    COLLECTED_SHARES=()
+    master_key=""
+    shares_json=""
+
+    # Transition to unsealed
+    rm -f "$SEALED_FILE"
+
+    audit_append "sys.unseal" "/v1/sys/unseal" "operator" "{}" 2>/dev/null || true
+
+    http_respond 200 "{\"sealed\":false,\"progress\":\"${k}/${k}\"}"
+}
+
+# POST /v1/sys/seal
+# Purges the KEK from memory and returns to sealed state.
+handle_sys_seal() {
+    local token="${1:-}"
+    crypto_zero_kek
+    touch "$SEALED_FILE"
+    COLLECTED_SHARES=()
+    audit_append "sys.seal" "/v1/sys/seal" "$token" "{}" 2>/dev/null || true
+    http_no_content
+}
+
+# PUT /v1/secrets/{path}
+handle_secret_put() {
+    local secret_path="$1"
+    local body="$2"
+    local token="$3"
+
+    local encrypted
+    encrypted=$(crypto_encrypt_secret "$body") || {
+        http_respond 500 '{"error":"encryption failed"}'
+        return
+    }
+
+    local version
+    version=$(storage_put_version "secret:${secret_path}" "$encrypted")
+
+    audit_append "secret.write" "$secret_path" "$token" "{\"version\":$version}" 2>/dev/null || true
+
+    http_respond 201 "{\"version\":$version}"
+}
+
+# GET /v1/secrets/{path}[?version=N]
+handle_secret_get() {
+    local secret_path="$1"
+    local query="$2"
+    local token="$3"
+
+    local version=""
+    if [[ "$query" == *"version="* ]]; then
+        version="${query#*version=}"
+        version="${version%%&*}"
+    fi
+
+    local encrypted
+    if [[ -n "$version" ]]; then
+        encrypted=$(storage_get_version "secret:${secret_path}" "$version" 2>/dev/null) || {
+            http_respond 404 '{"error":"version not found"}'
+            return
+        }
+    else
+        encrypted=$(storage_get "secret:${secret_path}" 2>/dev/null) || {
+            http_respond 404 '{"error":"secret not found"}'
+            return
+        }
+        version=$(storage_latest_version "secret:${secret_path}")
+    fi
+
+    # Decrypt the secret
+    local ciphertext nonce wrapped_dek dek_nonce plaintext
+    ciphertext=$(printf '%s' "$encrypted"  | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['ciphertext'])")
+    nonce=$(printf '%s' "$encrypted"       | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['nonce'])")
+    wrapped_dek=$(printf '%s' "$encrypted" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['wrapped_dek'])")
+    dek_nonce=$(printf '%s' "$encrypted"   | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['dek_nonce'])")
+
+    plaintext=$(crypto_decrypt_secret "$ciphertext" "$nonce" "$wrapped_dek" "$dek_nonce") || {
+        http_respond 500 '{"error":"decryption failed"}'
+        return
+    }
+
+    # Create a lease for this read
+    local lease_id
+    lease_id=$(lease_create "$secret_path" "${DEFAULT_LEASE_TTL:-3600}")
+
+    audit_append "secret.read" "$secret_path" "$token" "{\"version\":$version,\"lease_id\":\"$lease_id\"}" 2>/dev/null || true
+
+    http_respond 200 "{\"data\":${plaintext},\"version\":${version},\"lease\":{\"id\":\"${lease_id}\",\"ttl\":${DEFAULT_LEASE_TTL:-3600}}}"
+}
+
+# DELETE /v1/secrets/{path}
+handle_secret_delete() {
+    local secret_path="$1"
+    local token="$2"
+
+    storage_delete "secret:${secret_path}" || {
+        http_respond 404 '{"error":"secret not found"}'
+        return
+    }
+
+    audit_append "secret.delete" "$secret_path" "$token" "{}" 2>/dev/null || true
+    http_no_content
+}
+
+# GET /v1/dynamic-postgres/{role}
+handle_dynamic_postgres_get() {
+    local role_name="$1"
+    local token="$2"
+
+    local grants=""
+    local result
+    result=$(dynamic_mint_role "$role_name" "$grants") || {
+        http_respond 500 '{"error":"failed to mint dynamic credential"}'
+        return
+    }
+
+    audit_append "dynamic.read" "dynamic-postgres/${role_name}" "$token" "{}" 2>/dev/null || true
+
+    http_respond 200 "$result"
+}
+
+# POST /v1/auth/login
+handle_auth_login() {
+    local body="$1"
+
+    local username password
+    username=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('username',''))" 2>/dev/null)
+    password=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('password',''))" 2>/dev/null)
+
+    if [[ -z "$username" || -z "$password" ]]; then
+        http_respond 400 '{"error":"username and password required"}'
+        return
+    fi
+
+    local token
+    token=$(auth_login "$username" "$password")
+
+    if [[ "$token" == "FAIL" ]]; then
+        audit_append "auth.login.fail" "/v1/auth/login" "anonymous" "{\"username\":\"$username\"}" 2>/dev/null || true
+        http_respond 401 '{"error":"invalid credentials"}'
+        return
+    fi
+
+    local policies
+    policies=$(storage_get "token:${token}:policies" 2>/dev/null) || policies='[]'
+
+    audit_append "auth.login" "/v1/auth/login" "${token:0:8}" "{\"username\":\"$username\"}" 2>/dev/null || true
+
+    http_respond 200 "{\"token\":\"${token}\",\"policies\":${policies}}"
+}
+
+# POST /v1/auth/revoke
+handle_auth_revoke() {
+    local body="$1"
+    local requesting_token="${2:-}"
+
+    local target_token
+    target_token=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('token',''))" 2>/dev/null)
+
+    if [[ -z "$target_token" ]]; then
+        http_respond 400 '{"error":"token required"}'
+        return
+    fi
+
+    # Synchronous revocation — next request with this token returns 401 immediately
+    auth_revoke_token "$target_token"
+
+    audit_append "auth.revoke" "/v1/auth/revoke" "$requesting_token" "{}" 2>/dev/null || true
+    http_no_content
+}
+
+# GET /v1/auth/self
+handle_auth_self() {
+    local token="$1"
+    local result
+    result=$(auth_get_self "$token")
+    http_respond 200 "$result"
+}
+
+# PUT /v1/policies/{name}
+handle_policy_put() {
+    local policy_name="$1"
+    local body="$2"
+    local token="$3"
+
+    local rules
+    rules=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('rules',[])))" 2>/dev/null)
+
+    policy_put "$policy_name" "$rules"
+
+    audit_append "policy.write" "/v1/policies/${policy_name}" "$token" "{}" 2>/dev/null || true
+    http_respond 201 "{\"name\":\"${policy_name}\",\"rules\":${rules}}"
+}
+
+# GET /v1/policies/{name}
+handle_policy_get() {
+    local policy_name="$1"
+    local token="$2"
+
+    local rules
+    rules=$(policy_get "$policy_name")
+
+    if [[ "$rules" == "null" ]]; then
+        http_respond 404 '{"error":"policy not found"}'
+        return
+    fi
+
+    http_respond 200 "{\"rules\":${rules}}"
+}
+
+# POST /v1/leases/{id}/renew
+handle_lease_renew() {
+    local lease_id="$1"
+    local token="$2"
+
+    local new_ttl
+    new_ttl=$(lease_renew "$lease_id")
+
+    if [[ "$new_ttl" == "FAIL" ]]; then
+        http_respond 400 '{"error":"lease cannot be renewed (expired or at max TTL)"}'
+        return
+    fi
+
+    audit_append "lease.renew" "/v1/leases/${lease_id}/renew" "$token" "{\"lease_id\":\"$lease_id\"}" 2>/dev/null || true
+    http_respond 200 "{\"new_ttl\":${new_ttl}}"
+}
+
+# POST /v1/leases/{id}/revoke
+handle_lease_revoke() {
+    local lease_id="$1"
+    local token="$2"
+
+    lease_revoke "$lease_id"
+
+    audit_append "lease.revoke" "/v1/leases/${lease_id}/revoke" "$token" "{\"lease_id\":\"$lease_id\"}" 2>/dev/null || true
+    http_no_content
+}
+
+# ── Start the server ──────────────────────────────────────────────────────────
+echo "[strongbox] All handlers registered. Starting HTTP server..." >&2
+http_serve
