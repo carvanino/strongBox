@@ -31,23 +31,8 @@ Dynamic PostgreSQL credentials are generated on demand. A read from `dynamic-pos
 
 The cluster contains three StrongBox nodes: `strongbox1`, `strongbox2`, and `strongbox3`. Each node runs the same code with a different `NODE_ID`. Nodes communicate over internal HTTP endpoints for leader election, heartbeats, votes, and replication. Public clients do not call the internal endpoints directly.
 
-```text
-Client/App
-   |
-   | HTTPS
-   v
-Nginx reverse proxy
-   |
-   +----------------+----------------+
-   |                |                |
-   v                v                v
-StrongBox node1  StrongBox node2  StrongBox node3
-   |                |                |
-   +----------------+----------------+
-                    |
-                    v
-              PostgreSQL target DB
-```
+<img width="1536" height="946" alt="ChatGPT Image Jun 1, 2026, 05_29_19 PM" src="https://github.com/user-attachments/assets/bef15cb0-5073-4fa6-bd3b-74d1f358c8fc" />
+
 
 Nginx handles TLS termination and public routing. StrongBox handles security logic: sealed state, unseal, auth, policy checks, encryption, leases, dynamic credentials, consensus, and audit logging. PostgreSQL is the target system used by the dynamic secrets engine.
 
