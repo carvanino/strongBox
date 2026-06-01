@@ -21,7 +21,8 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY . /app
-RUN chmod +x /app/bin/strongbox /app/bin/strongbox-verify
+RUN find /app -type f \( -name "*.sh" -o -path "/app/bin/*" \) -exec sed -i 's/\r$//' {} \; \
+    && chmod +x /app/bin/strongbox /app/bin/strongbox-verify /app/bin/http-handler
 
 EXPOSE 8200
 

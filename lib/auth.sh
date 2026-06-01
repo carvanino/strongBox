@@ -1,64 +1,39 @@
-#!/bin/bash
-# =============================================================================
-# lib/auth.sh — Bearer tokens, Argon2id password hashing, policy enforcement
+#!/usr/bin/env bash
+# StrongBox auth, opaque bearer tokens, and policy enforcement.
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# All thresholds come from environment variables injected by config.yaml.
-# Defaults shown here are used when the variable is not set.
+set -uo pipefail
 
-TOKEN_TTL="${TOKEN_TTL:-3600}"            # seconds before a token expires
-ARGON2_TIME="${ARGON2_TIME:-3}"           # Argon2id: number of iterations
-ARGON2_MEMORY="${ARGON2_MEMORY:-65536}"   # Argon2id: memory in KB (64 MB)
-ARGON2_PARALLELISM="${ARGON2_PARALLELISM:-1}" # Argon2id: parallel threads
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! declare -F storage_get >/dev/null 2>&1; then
+    # shellcheck source=lib/storage.sh
+    source "$SCRIPT_DIR/storage.sh"
+fi
 
-# ── Storage key layout ────────────────────────────────────────────────────────
-# user:<username>:hash        → Argon2id encoded hash of the password
-# user:<username>:policies    → JSON array of policy names e.g. ["ops","read-only"]
-# token:<token>:valid         → "true" or "false"
-# token:<token>:policies      → JSON array of policy names
-# token:<token>:created_at    → unix timestamp (seconds)
-# token:<token>:username      → the user who obtained this token
-# policy:<name>:rules         → JSON array of rule objects
+TOKEN_TTL="${TOKEN_TTL:-3600}"
+ARGON2_TIME="${ARGON2_TIME:-3}"
+ARGON2_MEMORY="${ARGON2_MEMORY:-65536}"
+ARGON2_PARALLELISM="${ARGON2_PARALLELISM:-1}"
 
-# ── Private helpers ───────────────────────────────────────────────────────────
+auth_init() {
+    storage_init
+}
 
-# Generate a 32-byte (64 hex char) cryptographically random opaque token.
-# "Opaque" means the token string itself encodes nothing — all state lives
-# server-side in storage. This is what enables synchronous revocation.
 _generate_token() {
     openssl rand -hex 32
 }
 
-# Generate a 16-byte random salt for Argon2id.
 _generate_salt() {
     openssl rand -hex 16
 }
 
-# Current unix timestamp in seconds.
 _now() {
     date +%s
 }
 
-# Compute log2 of ARGON2_MEMORY for the argon2 CLI -m flag.
-# The argon2 CLI takes memory as a power-of-2 exponent, not raw KB.
-# e.g. 65536 KB = 2^16 → -m 16
 _log2_mem() {
     python3 -c "import math; print(int(math.log2(${ARGON2_MEMORY})))"
 }
 
-# Hash a password with Argon2id. Prints the full encoded hash string.
-# The encoded string embeds the salt and parameters, so it is self-contained
-# for future verification — we store this string and nothing else.
-#
-# Command breakdown:
-#   printf '%s' "$password"   → password bytes, no trailing newline
-#   | argon2 <salt>           → salt passed as positional argument
-#   -id                       → use Argon2id variant (hybrid: GPU + side-channel resistant)
-#   -t $ARGON2_TIME           → number of iterations (time cost)
-#   -m $(_log2_mem)           → memory as log2(KB): -m 16 = 64 MB
-#   -p $ARGON2_PARALLELISM    → parallel threads
-#   -l 32                     → output hash length: 32 bytes = 256 bits
-#   -e                        → output only the encoded hash string (no extra text)
 _hash_password() {
     local password="$1"
     local salt
@@ -71,30 +46,212 @@ _hash_password() {
         -e
 }
 
-# Verify a plaintext password against a stored Argon2id encoded hash.
-# Returns 0 if they match, 1 if they do not.
-# We use Python argon2-cffi because it can verify against the full encoded
-# hash string (which embeds the salt) — the argon2 CLI cannot do this
-# reliably without re-parsing the hash manually.
 _verify_password() {
     local password="$1"
     local stored_hash="$2"
-    python3 - <<PYEOF
+    python3 - "$password" "$stored_hash" <<'PY'
 import sys
+
+password, stored_hash = sys.argv[1:3]
 try:
     from argon2 import PasswordHasher
-    PasswordHasher().verify("${stored_hash}", "${password}")
-    sys.exit(0)
+    PasswordHasher().verify(stored_hash, password)
 except Exception:
-    sys.exit(1)
-PYEOF
+    raise SystemExit(1)
+PY
 }
 
-# Return 0 (true) if the token has lived longer than TOKEN_TTL seconds.
+_json_array_contains() {
+    local json="$1"
+    local value="$2"
+    python3 -c 'import json,sys; raw,value=sys.argv[1:3];
+try:
+ data=json.loads(raw)
+except Exception:
+ data=[]
+print("true" if value in data else "false")' "$json" "$value"
+}
+
+_token_has_root_policy() {
+    local token="$1"
+    local policies
+    policies=$(storage_get "token:${token}:policies" 2>/dev/null || echo "[]")
+    [[ "$(_json_array_contains "$policies" root)" == "true" ]]
+}
+
 _token_expired() {
     local token="$1"
     local created_at
+
+    _token_has_root_policy "$token" && return 1
     created_at=$(storage_get "token:${token}:created_at" 2>/dev/null) || return 0
-    local age=$(( $(_now) - created_at ))
-    [[ $age -ge $TOKEN_TTL ]]
+    [[ $(( $(_now) - created_at )) -ge "$TOKEN_TTL" ]]
+}
+
+auth_create_user() {
+    local username="$1"
+    local password="$2"
+    local policies_json="${3:-[]}"
+    local hash
+
+    [[ -z "$username" || -z "$password" ]] && return 1
+    printf '%s' "$policies_json" | python3 -m json.tool >/dev/null 2>&1 || return 1
+
+    hash=$(_hash_password "$password") || return 1
+    storage_put "user:${username}:hash" "$hash"
+    storage_put "user:${username}:policies" "$policies_json"
+}
+
+auth_login() {
+    local username="$1"
+    local password="$2"
+    local hash policies token
+
+    hash=$(storage_get "user:${username}:hash" 2>/dev/null) || {
+        echo "FAIL"
+        return 1
+    }
+
+    if ! _verify_password "$password" "$hash"; then
+        echo "FAIL"
+        return 1
+    fi
+
+    policies=$(storage_get "user:${username}:policies" 2>/dev/null || echo "[]")
+    token=$(_generate_token)
+    storage_put "token:${token}:valid" "true"
+    storage_put "token:${token}:policies" "$policies"
+    storage_put "token:${token}:created_at" "$(_now)"
+    storage_put "token:${token}:username" "$username"
+    echo "$token"
+}
+
+auth_verify_token() {
+    local token="$1"
+    local valid policies
+
+    [[ -z "$token" ]] && {
+        echo "INVALID"
+        return 1
+    }
+
+    valid=$(storage_get "token:${token}:valid" 2>/dev/null) || {
+        echo "INVALID"
+        return 1
+    }
+    [[ "$valid" != "true" ]] && {
+        echo "INVALID"
+        return 1
+    }
+
+    if _token_expired "$token"; then
+        storage_put "token:${token}:valid" "false"
+        echo "INVALID"
+        return 1
+    fi
+
+    policies=$(storage_get "token:${token}:policies" 2>/dev/null || echo "[]")
+    echo "$policies"
+}
+
+auth_revoke_token() {
+    local token="$1"
+    storage_put "token:${token}:valid" "false"
+}
+
+auth_get_self() {
+    local token="$1"
+    local policies username created_at ttl age
+
+    policies=$(auth_verify_token "$token")
+    if [[ "$policies" == "INVALID" ]]; then
+        echo '{"error":"invalid token"}'
+        return 1
+    fi
+
+    username=$(storage_get "token:${token}:username" 2>/dev/null || echo "")
+    created_at=$(storage_get "token:${token}:created_at" 2>/dev/null || echo "$(_now)")
+
+    if _token_has_root_policy "$token"; then
+        ttl=0
+    else
+        age=$(( $(_now) - created_at ))
+        ttl=$(( TOKEN_TTL - age ))
+        [[ "$ttl" -lt 0 ]] && ttl=0
+    fi
+
+    printf '{"token_id":"%s","username":"%s","policies":%s,"ttl":%d}\n' \
+        "${token:0:8}" "$username" "$policies" "$ttl"
+}
+
+policy_put() {
+    local name="$1"
+    local rules_json="$2"
+
+    printf '%s' "$rules_json" | python3 -m json.tool >/dev/null 2>&1 || return 1
+    storage_put "policy:${name}:rules" "$rules_json"
+}
+
+policy_get() {
+    local name="$1"
+    storage_get "policy:${name}:rules" 2>/dev/null || echo "null"
+}
+
+_auth_normalize_path() {
+    local path="$1"
+    path="${path#/}"
+    path="${path#v1/}"
+    case "$path" in
+        secrets/*) path="secret/${path#secrets/}" ;;
+    esac
+    printf '%s\n' "$path"
+}
+
+auth_check_policy() {
+    local token="$1"
+    local path="$2"
+    local capability="$3"
+    local policies request_path policy rules allowed
+
+    policies=$(auth_verify_token "$token")
+    if [[ "$policies" == "INVALID" ]]; then
+        echo "DENY"
+        return 1
+    fi
+
+    if _token_has_root_policy "$token"; then
+        echo "ALLOW"
+        return 0
+    fi
+
+    request_path=$(_auth_normalize_path "$path")
+
+    local policy_list
+    policy_list=$(python3 -c 'import json,sys; print(" ".join(str(x) for x in json.loads(sys.argv[1])))' "$policies" 2>/dev/null || true)
+
+    for policy in $policy_list; do
+        policy="${policy//$'\r'/}"
+        [[ -z "$policy" ]] && continue
+        rules=$(policy_get "$policy")
+        [[ "$rules" == "null" ]] && continue
+
+        allowed=$(python3 -c 'import fnmatch,json,sys
+rules=json.loads(sys.argv[1])
+request_path=sys.argv[2]
+capability=sys.argv[3]
+for rule in rules:
+    rule_path=str(rule.get("path",""))
+    caps=rule.get("capabilities",[])
+    if capability in caps and fnmatch.fnmatchcase(request_path, rule_path):
+        print("ALLOW")
+        raise SystemExit(0)
+print("DENY")' "$rules" "$request_path" "$capability")
+        if [[ "$allowed" == "ALLOW" ]]; then
+            echo "ALLOW"
+            return 0
+        fi
+    done
+
+    echo "DENY"
+    return 1
 }
