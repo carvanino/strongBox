@@ -159,13 +159,14 @@ print(d.get('share', ''))
         return
     fi
 
-    # Replicate to peers if not already replicated
+    # Replicate to peers before processing locally
     if [[ "$query" != *"replicated=true"* ]]; then
         sys_replicate_to_peers "POST" "/v1/sys/unseal?replicated=true" "$body"
     fi
 
     # Save to RAM-backed shares file
     mkdir -p "$RUN_DIR"
+
     if [[ -f "$RUN_DIR/shares" ]]; then
         if ! grep -qxF "$share" "$RUN_DIR/shares"; then
             echo "$share" >> "$RUN_DIR/shares"
@@ -177,9 +178,12 @@ print(d.get('share', ''))
     local k
     k=$(storage_get "sys:shares_required" 2>/dev/null) || k=${SHAMIR_K:-2}
 
+    # Filter blank lines when reading — prevents ValueError on reconstruction
     local collected_shares=()
     if [[ -f "$RUN_DIR/shares" ]]; then
-        mapfile -t collected_shares < "$RUN_DIR/shares"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && collected_shares+=("$line")
+        done < "$RUN_DIR/shares"
     fi
     local collected=${#collected_shares[@]}
 
@@ -200,15 +204,19 @@ print(d.get('share', ''))
 import sys, json
 shares = []
 for s in sys.argv[1:]:
-    x, y = s.split(',', 1)
-    shares.append({'x': int(x), 'y': y})
+    parts = s.split(',', 1)
+    if len(parts) != 2:
+        continue
+    x, y = parts
+    shares.append({'x': int(x), 'y': y.strip()})
 print(json.dumps(shares))
 " "${collected_shares[@]}")
 
     local master_key
-    master_key=$(python3 "$LIB_DIR/shamir.py" reconstruct "$shares_json" "$secret_len" 2>/dev/null)
+    master_key=$(python3 "$LIB_DIR/shamir.py" reconstruct "$shares_json" "$secret_len" 2>&1)
+    local exit_code=$?
 
-    if [[ -z "$master_key" ]]; then
+    if [[ $exit_code -ne 0 || -z "$master_key" ]]; then
         http_respond 400 '{"error":"share reconstruction failed — invalid or insufficient shares"}'
         # Clear RAM shares
         if [[ -f "$RUN_DIR/shares" ]]; then
@@ -292,6 +300,7 @@ handle_secret_get() {
     local token="$3"
 
     local version=""
+
     if [[ "$query" == *"version="* ]]; then
         version="${query#*version=}"
         version="${version%%&*}"
@@ -350,16 +359,14 @@ handle_secret_delete() {
 handle_dynamic_postgres_get() {
     local role_name="$1"
     local token="$2"
-
-    local grants=""
     local result
-    result=$(dynamic_mint_role "$role_name" "$grants") || {
+
+    result=$(dynamic_mint_role "$role_name" "") || {
         http_respond 500 '{"error":"failed to mint dynamic credential"}'
         return
     }
 
     audit_append "dynamic.read" "dynamic-postgres/${role_name}" "$token" "{}" 2>/dev/null || true
-
     http_respond 200 "$result"
 }
 
@@ -368,6 +375,7 @@ handle_auth_login() {
     local body="$1"
 
     local username password
+
     username=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('username',''))" 2>/dev/null)
     password=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('password',''))" 2>/dev/null)
 
@@ -399,6 +407,7 @@ handle_auth_revoke() {
     local requesting_token="${2:-}"
 
     local target_token
+
     target_token=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('token',''))" 2>/dev/null)
 
     if [[ -z "$target_token" ]]; then
@@ -428,6 +437,7 @@ handle_user_put() {
     local token="$3"
 
     local password policies
+
     password=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('password',''))" 2>/dev/null)
     policies=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('policies',[])))" 2>/dev/null)
 
@@ -452,6 +462,7 @@ handle_policy_put() {
     local token="$3"
 
     local rules
+
     rules=$(printf '%s' "$body" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('rules',[])))" 2>/dev/null)
 
     policy_put "$policy_name" "$rules"
@@ -466,6 +477,7 @@ handle_policy_get() {
     local token="$2"
 
     local rules
+
     rules=$(policy_get "$policy_name")
 
     if [[ "$rules" == "null" ]]; then
@@ -482,6 +494,7 @@ handle_lease_renew() {
     local token="$2"
 
     local new_ttl
+
     new_ttl=$(lease_renew "$lease_id")
 
     if [[ "$new_ttl" == "FAIL" ]]; then
