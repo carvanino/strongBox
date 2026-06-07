@@ -516,3 +516,66 @@ handle_lease_revoke() {
     audit_append "lease.revoke" "/v1/leases/${lease_id}/revoke" "$token" "{\"lease_id\":\"$lease_id\"}" 2>/dev/null || true
     http_no_content
 }
+
+# GET /v1/leases/{id}
+handle_lease_get() {
+    local lease_id="$1"
+    local result
+    result=$(lease_get "$lease_id" 2>/dev/null) || {
+        http_respond 404 '{"error":"lease not found"}'
+        return
+    }
+    [[ -z "$result" || "$result" == "null" ]] && {
+        http_respond 404 '{"error":"lease not found"}'
+        return
+    }
+    http_respond 200 "$result"
+}
+
+# GET /v1/sys/audit/verify?tamper=true|false
+# Runs strongbox-verify against the live audit log.
+# If tamper=true, creates a tampered copy first to demonstrate detection.
+handle_audit_verify() {
+    local tamper="${1:-false}"
+    local log_path="${AUDIT_LOG:-/data/audit/audit.log}"
+    local key_file
+    key_file="$(dirname "$log_path")/.audit-hmac-key"
+
+    if [[ ! -f "$log_path" ]]; then
+        http_respond 404 '{"error":"audit log not found"}'
+        return
+    fi
+
+    local verify_target="$log_path"
+
+    if [[ "$tamper" == "true" ]]; then
+        cp "$log_path" /tmp/audit-tampered-demo.log
+        python3 -c "
+import sys
+with open('/tmp/audit-tampered-demo.log', 'r') as f:
+    content = f.read()
+if len(content) > 60:
+    content = content[:50] + ('X' if content[50] != 'X' else 'Y') + content[51:]
+with open('/tmp/audit-tampered-demo.log', 'w') as f:
+    f.write(content)
+" 2>/dev/null
+        verify_target="/tmp/audit-tampered-demo.log"
+    fi
+
+    local output exit_code
+    output=$(AUDIT_HMAC_KEY_HEX=$(cat "$key_file" 2>/dev/null) \
+        /app/bin/strongbox-verify "$verify_target" 2>&1) || true
+    exit_code=$?
+
+    local escaped
+    escaped=$(printf '%s' "$output" | python3 -c "
+import sys, json
+print(json.dumps(sys.stdin.read()))
+" 2>/dev/null) || escaped="\"$output\""
+
+    if [[ $exit_code -eq 0 ]]; then
+        http_respond 200 "{\"result\":\"OK\",\"output\":${escaped},\"tampered_test\":$tamper}"
+    else
+        http_respond 200 "{\"result\":\"TAMPERED\",\"output\":${escaped},\"tampered_test\":$tamper}"
+    fi
+}
