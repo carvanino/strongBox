@@ -306,6 +306,14 @@ http_route() {
                 /v1/leases/*/revoke)
                     [[ "$method" == "POST" ]] && http_call_or_stub handle_lease_revoke "$(basename "$(dirname "$path")")" "$token" || http_respond 405 '{"error":"method not allowed"}'
                     ;;
+                /v1/leases/*)
+                    [[ "$method" == "GET" ]] && http_call_or_stub handle_lease_get "${path#/v1/leases/}" || http_respond 405 '{"error":"method not allowed"}'
+                    ;;
+                /v1/sys/audit/verify)
+                    local tamper_param="false"
+                    [[ "$query" == *"tamper=true"* ]] && tamper_param="true"
+                    [[ "$method" == "GET" ]] && http_call_or_stub handle_audit_verify "$tamper_param" || http_respond 405 '{"error":"method not allowed"}'
+                    ;;
                 /v1/audit)
                     [[ "$method" == "GET" ]] && http_call_or_stub handle_audit_query "$query" "$token" || http_respond 405 '{"error":"method not allowed"}'
                     ;;
